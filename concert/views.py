@@ -1,75 +1,76 @@
+import requests
+from django.conf import settings
 from django.contrib.auth import login, logout
-from django.contrib.auth.models import User
-from django.http import HttpResponseRedirect, HttpResponse
-from django.shortcuts import get_object_or_404
-from django.shortcuts import render
-from django.urls import reverse
-from django.contrib.auth.hashers import make_password
-
+from django.contrib.auth.decorators import login_required
+from django.http import HttpResponseBadRequest
+from django.shortcuts import get_object_or_404, redirect, render
+from django.views.decorators.http import require_POST
 from concert.forms import LoginForm, SignUpForm
 from concert.models import Concert, ConcertAttending
-import requests as req
-
-
-# Create your views here.
 
 def signup(request):
-    pass
-
+    form = SignUpForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        user = form.save()
+        login(request, user)
+        return redirect("index")
+    return render(request, "signup.html", {"form": form})
 
 def index(request):
     return render(request, "index.html")
 
+def remote_items(url, key):
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    value = response.json()
+    return value.get(key, []) if isinstance(value, dict) else value
 
 def songs(request):
-    # songs = {"songs":[]}
-    # return render(request, "songs.html", {"songs": [insert list here]})
-    pass
-
+    try:
+        items = remote_items(settings.SONGS_SERVICE_URL, "songs")
+    except (requests.RequestException, ValueError):
+        return render(request, "songs.html", {"songs": [], "service_error": "Songs are temporarily unavailable."}, status=503)
+    return render(request, "songs.html", {"songs": items})
 
 def photos(request):
-    # photos = []
-    # return render(request, "photos.html", {"photos": photos})
-    pass
+    try:
+        items = remote_items(settings.PICTURES_SERVICE_URL, "pictures")
+    except (requests.RequestException, ValueError):
+        return render(request, "photos.html", {"photos": [], "service_error": "Photos are temporarily unavailable."}, status=503)
+    return render(request, "photos.html", {"photos": items})
 
 def login_view(request):
-    pass
+    form = LoginForm(request=request, data=request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        login(request, form.get_user())
+        return redirect("index")
+    return render(request, "login.html", {"form": form})
 
+@require_POST
 def logout_view(request):
-    pass
+    logout(request)
+    return redirect("index")
 
+@login_required(login_url="login")
 def concerts(request):
-    pass
+    attendance = dict(ConcertAttending.objects.filter(user=request.user).values_list("concert_id", "attending"))
+    rows = [{"concert": concert, "status": attendance.get(concert.id, "-")} for concert in Concert.objects.order_by("date", "id")]
+    return render(request, "concerts.html", {"concerts": rows})
 
-
+@login_required(login_url="login")
 def concert_detail(request, id):
-    if request.user.is_authenticated:
-        obj = Concert.objects.get(pk=id)
-        try:
-            status = obj.attendee.filter(user=request.user).first().attending
-        except:
-            status = "-"
-        return render(request, "concert_detail.html", {"concert_details": obj, "status": status, "attending_choices": ConcertAttending.AttendingChoices.choices})
-    else:
-        return HttpResponseRedirect(reverse("login"))
-    pass
+    concert = get_object_or_404(Concert, pk=id)
+    response = concert.attendee.filter(user=request.user).first()
+    status = response.attending if response else "-"
+    return render(request, "concert_detail.html", {"concert_details": concert, "status": status, "attending_choices": ConcertAttending.AttendingChoices.choices})
 
-
+@login_required(login_url="login")
+@require_POST
 def concert_attendee(request):
-    if request.user.is_authenticated:
-        if request.method == "POST":
-            concert_id = request.POST.get("concert_id")
-            attendee_status = request.POST.get("attendee_choice")
-            concert_attendee_object = ConcertAttending.objects.filter(
-                concert_id=concert_id, user=request.user).first()
-            if concert_attendee_object:
-                concert_attendee_object.attending = attendee_status
-                concert_attendee_object.save()
-            else:
-                ConcertAttending.objects.create(concert_id=concert_id,
-                                                user=request.user,
-                                                attending=attendee_status)
-
-        return HttpResponseRedirect(reverse("concerts"))
-    else:
-        return HttpResponseRedirect(reverse("index"))
+    concert_id = request.POST.get("concert_id", "")
+    status = request.POST.get("attendee_choice")
+    if not concert_id.isdigit() or status not in ConcertAttending.AttendingChoices.values:
+        return HttpResponseBadRequest("Invalid concert or attendance choice")
+    concert = get_object_or_404(Concert, pk=int(concert_id))
+    ConcertAttending.objects.update_or_create(concert=concert, user=request.user, defaults={"attending": status})
+    return redirect("concerts")
